@@ -1,8 +1,8 @@
 # Notion 公式自动转换工具
 
-> **社区维护版 v3.5.1** · Fork 自 [skyance/Notion-Formula-Auto-Conversion-Tool](https://github.com/skyance/Notion-Formula-Auto-Conversion-Tool)
+> **社区维护版 v3.5.2** · Fork 自 [skyance/Notion-Formula-Auto-Conversion-Tool](https://github.com/skyance/Notion-Formula-Auto-Conversion-Tool)
 
-将粘贴到 Notion 的 LaTeX 公式文本批量转换为 Notion 原生公式，减少逐条编辑的工作量。本 Fork 主要修复 Notion 新域名、悬浮按钮消失，以及块级公式转换问题。
+将粘贴到 Notion 的 LaTeX 公式文本批量转换为 Notion 原生公式，减少逐条编辑的工作量。本 Fork 主要修复 Notion 新域名、悬浮按钮消失、块级公式转换，以及中文界面的斜杠菜单匹配问题。
 
 **[⬇️ 一键安装脚本](https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.user.js)**（需先安装 Tampermonkey）
 
@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/b14c5afa-d8dc-4266-bc95-e6b8627f6643
 - **悬浮按钮**：支持拖动、折叠、点击停止与转换进度显示。
 - **快捷入口**：支持从 Tampermonkey 菜单启动转换，保留累计转换计数。
 - **混排行公式降级**：独立占一行的块公式尝试转换为公式块；混在文字中的块级定界符按行内公式处理。
+- **跨块块公式**：多行 `$$...$$`、`\[...\]` 被 Notion 拆成多个块时，自动合并为一个块公式。
 - **简单表格**：尝试识别部分简单表格的行内公式；不支持数据库表格。
 
 ## 🛠️ 安装（本 Fork）
@@ -55,6 +56,14 @@ $$
 ### 从 AI 回答复制公式
 
 建议要求 AI **保留原始 LaTeX/KaTeX 公式和 `$...$` / `$$...$$` 定界符**。不同模型网页的「复制回答」「复制 Markdown」行为可能不同，最好先确认粘贴到 Notion 后仍然保留定界符。必要时使用「复制 Markdown」或纯文本粘贴。
+
+## 🔧 v3.5.2 修改记录
+
+| 问题 | 修复方式 |
+| --- | --- |
+| 多行块公式被 Notion 拆成多个块后无法识别 | 沿页面块顺序查找闭合定界符，把跨块组转换为一个块公式 |
+| 中文界面找不到块公式菜单项 | 菜单项匹配新增 `公式`；按菜单语言输入搜索词（中文 `公式`，英文 `math`） |
+| 斜杠菜单失败后无法恢复原文 | 用 `data-block-id` 重新定位块元素；跨块失败时恢复为单行文本 |
 
 ## 🔧 v3.5.1 修改记录
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Notion-Formula-Auto-Conversion-Tool
 // @namespace    http://tampermonkey.net/
-// @version      3.5.1
+// @version      3.5.2
 // @description  Notion 自动公式转换工具
 // @author       skyance、0xstride、fengjy73、Sparidae、ckrvxr
 // @match        https://www.notion.so/*
@@ -256,6 +256,7 @@
       for (const editor of getEditableEditors()) {
         count += findFormulas(editor.textContent).length;
       }
+      count += findCrossBlockGroups().length;
       if (count !== lastCount) {
         lastCount = count;
         progressText.textContent = count ? `${count}` : "0";
@@ -587,6 +588,23 @@
     return range;
   }
 
+  function findTextPosition(root, offset) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let currentOffset = 0;
+    let node;
+    while ((node = walker.nextNode())) {
+      const length = node.textContent.length;
+      if (offset <= currentOffset + length) {
+        return {
+          node,
+          offset: Math.min(Math.max(offset - currentOffset, 0), length),
+        };
+      }
+      currentOffset += length;
+    }
+    return null;
+  }
+
   async function focusEditor(editor) {
     if (!editor) return;
     await ensureFocus(editor);
@@ -783,6 +801,148 @@
     return tasks;
   }
 
+  // 跨块块公式：粘贴多行 LaTeX 时，Notion 把每一行拆成独立块。
+  // 例：块 A 只有 "\["，中间是公式行，块 Z 只有 "\]"。
+  // Notion 的块不一定互为兄弟节点，所以先向上找兄弟，再向下找可编辑块。
+  function nextEditableBlock(editor) {
+    let node = editor.closest("[data-block-id]") || editor;
+    let guard = 0;
+    while (node && node !== document.body && guard++ < 40) {
+      let sibling = node.nextElementSibling;
+      while (!sibling) {
+        node = node.parentElement;
+        if (!node || node === document.body) return null;
+        sibling = node.nextElementSibling;
+      }
+      const leaves = sibling.matches('[contenteditable="true"]')
+        ? [sibling]
+        : Array.from(sibling.querySelectorAll('[contenteditable="true"]'));
+      if (leaves.length) {
+        const next = leaves[0];
+        if (next.closest(
+          ".notion-code-block, .notion-equation-block, .notion-table-view, td, th",
+        )) {
+          return null;
+        }
+        return next;
+      }
+      node = sibling;
+    }
+    return null;
+  }
+
+  function findCrossBlockGroups() {
+    const editors = getEditableEditors();
+    const groups = [];
+    const consumed = new Set();
+
+    const findOpener = (text) => {
+      let best = null;
+      const consider = (token, closeToken) => {
+        let idx = text.indexOf(token);
+        while (idx !== -1 && isEscaped(text, idx)) {
+          idx = text.indexOf(token, idx + token.length);
+        }
+        if (idx === -1) return;
+        // 同一块内能闭合的公式由 findFormulas 处理。
+        if (findUnescapedToken(text, closeToken, idx + token.length) !== -1) return;
+        if (!best || idx < best.start) best = { start: idx, closeToken };
+      };
+      consider("\\[", "\\]");
+      consider("$$", "$$");
+      return best;
+    };
+
+    for (const editor of editors) {
+      if (consumed.has(editor)) continue;
+      const text = editor.textContent || "";
+      const opener = findOpener(text);
+      if (!opener) continue;
+      if (text.slice(0, opener.start).trim() !== "") continue;
+
+      const wrapper = editor.closest("[data-block-id]");
+      if (!wrapper) continue;
+
+      const texts = [text];
+      const groupEditors = [editor];
+      let currentEditor = editor;
+      let prevRect = editor.getBoundingClientRect();
+      let endEditor = null;
+      let closeIndex = -1;
+      let valid = true;
+      let steps = 0;
+
+      while (!endEditor && steps++ < 80) {
+        const nextEditor = nextEditableBlock(currentEditor);
+        if (!nextEditor) {
+          valid = false;
+          break;
+        }
+        const nextRect = nextEditor.getBoundingClientRect();
+        if (
+          nextRect.top < prevRect.bottom - 4 ||
+          nextRect.right <= prevRect.left ||
+          nextRect.left >= prevRect.right
+        ) {
+          valid = false;
+          break;
+        }
+        prevRect = nextRect;
+        currentEditor = nextEditor;
+        const nextText = nextEditor.textContent || "";
+        groupEditors.push(nextEditor);
+        texts.push(nextText);
+        const idx = findUnescapedToken(nextText, opener.closeToken, 0);
+        if (idx !== -1) {
+          if (nextText.slice(idx + opener.closeToken.length).trim() !== "") {
+            valid = false;
+          } else {
+            endEditor = nextEditor;
+            closeIndex = idx;
+          }
+          break;
+        }
+      }
+
+      if (!valid || !endEditor) continue;
+
+      const lastText = texts[texts.length - 1];
+      const content = [
+        text.slice(opener.start + 2),
+        ...texts.slice(1, texts.length - 1),
+        lastText.slice(0, closeIndex),
+      ].join(" ").trim();
+      if (!content) continue;
+
+      const endWrapper = endEditor.closest("[data-block-id]");
+      const nextWrapper = endWrapper?.nextElementSibling;
+      const nextBlockId =
+        nextWrapper?.getAttribute("data-block-id") ||
+        nextWrapper?.querySelector("[data-block-id]")?.getAttribute("data-block-id") ||
+        null;
+
+      groups.push({
+        startEditor: editor,
+        start: opener.start,
+        endEditor,
+        end: closeIndex + 2,
+        blockId: wrapper.getAttribute("data-block-id"),
+        endBlockId: endWrapper?.getAttribute("data-block-id") || null,
+        nextBlockId,
+        raw: [
+          text.slice(opener.start),
+          ...texts.slice(1, texts.length - 1),
+          lastText.slice(0, closeIndex + 2),
+        ].join("\n"),
+        content,
+      });
+
+      groupEditors.forEach((item) => consumed.add(item));
+    }
+
+    return groups;
+  }
+
   function restoreSelection(range) {
     if (!range) {
       return;
@@ -934,45 +1094,103 @@
     return true;
   }
 
-  function slashMenuRoot() {
-    const roots = document.querySelectorAll(
-      '.notion-overlay-container, [role="menu"], [role="listbox"]'
-    );
-    return Array.from(roots).find(root =>
+  function slashMenuRoots() {
+    return Array.from(
+      document.querySelectorAll('.notion-overlay-container, [role="menu"], [role="listbox"]')
+    ).filter(root =>
       isVisibleElement(root) &&
       root.querySelector('.notion-selectable, [role="menuitem"], [role="option"]')
-    ) || null;
+    );
+  }
+
+  function slashMenuRoot() {
+    return slashMenuRoots()[0] || null;
   }
 
   function findBlockEquationMenuItem() {
-    const root = slashMenuRoot();
-    if (!root) return null;
-    const items = root.querySelectorAll(
-      '.notion-selectable, [role="menuitem"], [role="option"]'
-    );
-    for (const item of items) {
-      if (!isVisibleElement(item)) continue;
-      const label = (item.textContent || "").replace(/\s+/g, " ").trim();
-      if (!label || label.length > 140 || /inline equation|行内公式|内联公式/i.test(label)) {
-        continue;
-      }
-      if (/^(?:block equation|equation|math equation|数学公式|块级公式|公式块|方程式)(?:\b|\s|$)/i.test(label)) {
-        return item;
+    for (const root of slashMenuRoots()) {
+      const items = root.querySelectorAll(
+        '.notion-selectable, [role="menuitem"], [role="option"]'
+      );
+      for (const item of items) {
+        if (!isVisibleElement(item)) continue;
+        const label = (item.textContent || "").replace(/\s+/g, " ").trim();
+        if (!label || label.length > 140 || /inline equation|行内公式|内联公式/i.test(label)) {
+          continue;
+        }
+        if (/block equation|math equation|equation|数学公式|块级公式|公式块|公式|方程式/i.test(label)) {
+          return item;
+        }
       }
     }
     return null;
   }
 
-  async function restoreFailedSlash(editor, start, original) {
-    if (!editor?.isConnected) return false;
+  async function restoreFailedSlash(editor, start, original, blockId = null, query = "") {
+    // Notion may re-render the block while the slash menu is open. Re-resolve
+    // the editor from its block id instead of using a stale element reference.
+    let liveEditor = editor?.isConnected ? editor : null;
+    if (!liveEditor && blockId) {
+      liveEditor = document.querySelector(
+        `[data-block-id="${CSS.escape(blockId)}"] [contenteditable="true"]`,
+      );
+    }
+    if (!liveEditor) return false;
     // Restore only when the current editor still contains the slash query
     // at the original position. Never overwrite an unrelated Notion block.
-    const suffix = (editor.textContent || "").slice(start);
-    const match = /^\/(?:math)?/.exec(suffix);
-    if (!match) return false;
-    const selection = await selectRange(editor, start, start + match[0].length);
-    if (!selection || selection.toString() !== match[0]) return false;
+    const expected = `/${query || ""}`;
+    const suffix = (liveEditor.textContent || "").slice(start);
+    if (!suffix.startsWith(expected)) return false;
+    const selection = await selectRange(liveEditor, start, start + expected.length);
+    if (!selection || selection.toString() !== expected) return false;
     return !!document.execCommand("insertText", false, original);
+  }
+
+  async function insertBlockEquation(editor, content) {
+    const blockId =
+      editor.closest?.("[data-block-id]")?.getAttribute("data-block-id") || null;
+    let query = null;
+    const fail = (reason, mutated) => ({ ok: false, reason, mutated, blockId, query });
+
+    if (!await typeSlashQuery("/")) {
+      return fail("无法触发块公式命令", false);
+    }
+    const menuRoot = await waitForCondition(slashMenuRoot, {timeout: 1100, interval: 30});
+    if (!menuRoot) {
+      return fail("斜杠菜单未打开", true);
+    }
+
+    let menuItem = findBlockEquationMenuItem();
+    if (!menuItem) {
+      // Notion slash search matches the localized item name. Typing "math"
+      // in a Chinese UI filters out every item, so pick the query by menu language.
+      query = /[㐀-鿿]/.test(menuRoot.textContent || "") ? "公式" : "math";
+      if (!await typeSlashQuery(query)) {
+        return fail("无法输入命令关键词", true);
+      }
+      menuItem = await waitForCondition(findBlockEquationMenuItem, {
+        timeout: 1500, interval: 35,
+      });
+    }
+    if (!menuItem) {
+      return fail("未找到块公式菜单项", true);
+    }
+    await simulateClick(menuItem);
+
+    const blockInput = await waitForInlineInput(editor, 40, 35);
+    if (!blockInput) {
+      return fail("块公式输入框未出现", true);
+    }
+    if (!selectElementContents(blockInput)) {
+      return fail("无法选中块公式输入框", true);
+    }
+    await simulateTyping(normalizeFormulaContent(content), true);
+    await sleep(30);
+    await simulateKey("Enter", blockInput);
+    await waitForCondition(() => document.activeElement !== blockInput, {
+      timeout: 800, interval: 35,
+    });
+    return { ok: true };
   }
 
   // 优化的公式转换
@@ -1023,47 +1241,18 @@
           return false;
         }
 
-        if (!await typeSlashQuery("/")) {
-          updateStatus("无法触发块公式命令，已跳过");
+        const result = await insertBlockEquation(editor, content);
+        if (!result.ok) {
+          if (result.mutated) {
+            const restored = await restoreFailedSlash(
+              editor, start, formulaObj.raw, result.blockId, result.query,
+            );
+            updateStatus(`${result.reason}，${restored ? "已恢复原文" : "请检查原文"}`);
+          } else {
+            updateStatus(`${result.reason}，已跳过`);
+          }
           return false;
         }
-        if (!await waitForCondition(slashMenuRoot, {timeout: 1100, interval: 30})) {
-          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
-          updateStatus(restored ? "斜杠菜单未打开，已恢复原文" : "斜杠菜单未打开，请检查原文");
-          return false;
-        }
-        if (!await typeSlashQuery("math")) {
-          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
-          updateStatus(restored ? "无法输入 math，已恢复原文" : "无法输入 math，请检查原文");
-          return false;
-        }
-        const menuItem = await waitForCondition(findBlockEquationMenuItem, {
-          timeout: 1500, interval: 35,
-        });
-        if (!menuItem) {
-          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
-          updateStatus(restored ? "未找到块公式菜单项，已恢复原文" : "未找到块公式菜单项，请检查原文");
-          return false;
-        }
-        await simulateClick(menuItem);
-
-        const blockInput = await waitForInlineInput(editor, 40, 35);
-        if (!blockInput) {
-          // The slash action may already have replaced the original block.
-          // Do not blindly undo other edits after a structural transformation.
-          updateStatus("块公式输入框未出现，请检查当前块");
-          return false;
-        }
-        if (!selectElementContents(blockInput)) {
-          updateStatus("无法选中块公式输入框，请检查当前块");
-          return false;
-        }
-        await simulateTyping(normalizedContent, true);
-        await sleep(30);
-        await simulateKey("Enter", blockInput);
-        await waitForCondition(() => document.activeElement !== blockInput, {
-          timeout: 800, interval: 35,
-        });
       } else {
         const opened = await openInlineEquationEditor(editor, range);
         if (!opened) {
@@ -1123,6 +1312,100 @@
     }
   }
 
+  async function insertPlainText(editor, text) {
+    if (!editor?.isConnected) return false;
+    await ensureFocus(editor);
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await sleep(10);
+    return !!document.execCommand("insertText", false, text);
+  }
+
+  async function convertCrossBlockFormula(group) {
+    const { start, end, raw, content } = group;
+    const lookupEditor = (id) =>
+      id
+        ? document.querySelector(
+          `[data-block-id="${CSS.escape(id)}"] [contenteditable="true"]`,
+        )
+        : null;
+    const startEditor =
+      (group.startEditor?.isConnected ? group.startEditor : null) ||
+      lookupEditor(group.blockId);
+    const endEditor =
+      (group.endEditor?.isConnected ? group.endEditor : null) ||
+      lookupEditor(group.endBlockId);
+    const startPos = startEditor && findTextPosition(startEditor, start);
+    const endPos = endEditor && findTextPosition(endEditor, end);
+    if (!startPos || !endPos) {
+      updateStatus("跨块公式选区创建失败，已跳过");
+      return false;
+    }
+
+    const compact = (text) => (text || "").replace(/\s+/g, "");
+
+    await focusEditor(startEditor);
+    const range = document.createRange();
+    range.setStart(startPos.node, startPos.offset);
+    range.setEnd(endPos.node, endPos.offset);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await sleep(40);
+
+    if (compact(selection.toString()) !== compact(raw)) {
+      updateStatus("跨块公式选区不匹配，已跳过");
+      return false;
+    }
+
+    // 用 Notion 自己的 Backspace 删除跨块选区，浏览器 execCommand 不能跨编辑根删除。
+    await simulateKey("Backspace", document.activeElement || startEditor);
+    const removed = await waitForCondition(() => {
+      const root = document.querySelector(".notion-page-content") || document.body;
+      return !compact(root.innerText).includes(compact(raw));
+    }, {timeout: 1500, interval: 40});
+    if (!removed) {
+      updateStatus("跨块公式删除失败，已跳过");
+      return false;
+    }
+
+    let target = lookupEditor(group.blockId);
+    if (!target && group.nextBlockId) {
+      const anchor = document.querySelector(
+        `[data-block-id="${CSS.escape(group.nextBlockId)}"]`,
+      );
+      const prev = anchor?.previousElementSibling;
+      target = prev?.matches('[contenteditable="true"]')
+        ? prev
+        : prev?.querySelector('[contenteditable="true"]') || null;
+    }
+    if (!target && document.activeElement?.isContentEditable) {
+      target = document.activeElement;
+    }
+    if (!target) {
+      updateStatus("未找到块公式插入位置，内容可能丢失");
+      return false;
+    }
+    if (compact(target.textContent) !== "") {
+      updateStatus("块公式插入位置不为空，已跳过，请检查原文");
+      return false;
+    }
+
+    await focusEditor(target);
+    const result = await insertBlockEquation(target, content);
+    if (!result.ok) {
+      const restored = await insertPlainText(target, raw);
+      updateStatus(
+        `${result.reason}，${restored ? "已恢复为单行文本" : "内容可能丢失"}`,
+      );
+      return false;
+    }
+    return true;
+  }
+
   // ---------- 核心转换 ----------
   async function convertFormulas() {
     if (isProcessing) return;
@@ -1132,6 +1415,7 @@
       // 扫描并获取总数
       const initialTasks = collectFormulaTasks();
       let totalFormulas = initialTasks.reduce((sum, item) => sum + item.formulas.length, 0);
+      totalFormulas += findCrossBlockGroups().length;
       if (totalFormulas === 0) {
         progressText.textContent = "0";
         progressBar.style.width = "0%";
@@ -1172,6 +1456,16 @@
               updateProgressIfNeeded();
             }
           }
+        }
+      }
+
+      // 跨块块公式放在最后，从页面底部往上转换，避免删除块影响前面的位置。
+      for (const group of findCrossBlockGroups().slice().reverse()) {
+        if (shouldStop) break;
+        const result = await convertCrossBlockFormula(group);
+        if (result) {
+          formulaCount++;
+          updateProgressIfNeeded();
         }
       }
 
@@ -1286,6 +1580,7 @@
       meta: { key: "Meta", code: "MetaLeft", keyCode: 91 },
       enter: { key: "Enter", code: "Enter", keyCode: 13 },
       escape: { key: "Escape", code: "Escape", keyCode: 27 },
+      backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
       e: { key: "e", code: "KeyE", keyCode: 69 },
     };
 
