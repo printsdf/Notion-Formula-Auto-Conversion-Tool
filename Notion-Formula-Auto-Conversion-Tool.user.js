@@ -14,8 +14,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @github       https://github.com/printsdf/Notion-Formula-Auto-Conversion-Tool
-// @downloadURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.js
-// @updateURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.js
+// @downloadURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.user.js
+// @updateURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.user.js
 // ==/UserScript==
 
 (function () {

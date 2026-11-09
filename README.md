@@ -4,8 +4,8 @@
 
 将粘贴到 Notion 的 LaTeX 公式文本批量转换为 Notion 原生公式，减少逐条编辑的工作量。本 Fork 主要修复 Notion 新域名、悬浮按钮消失，以及块级公式转换问题。
 
-> [!IMPORTANT]
-> **已完成代码修改与 JavaScript 语法检查，但尚未在真实 Notion 页面完成端到端验证。** 请先复制页面备份，在测试页面验证后再批量使用。
+**[⬇️ 一键安装脚本](https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.user.js)**（需先安装 Tampermonkey）
+
 
 ## 💻 演示
 
@@ -26,8 +26,8 @@ https://github.com/user-attachments/assets/b14c5afa-d8dc-4266-bc95-e6b8627f6643
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)。
 2. 在 Tampermonkey 中**禁用原 Greasy Fork 版本**，避免重复运行。
-3. 打开 [Fork 版本的脚本源码](https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.js)。
-4. 如果浏览器没有弹出脚本安装界面，在 Tampermonkey 中选择「添加新脚本」，复制完整源码并保存。
+3. 点击 **[⬇️ 安装本 Fork 脚本](https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.user.js)**，在 Tampermonkey 弹出的安装页中点击「安装」。
+4. 如果浏览器没有弹出安装页，在 Tampermonkey 中选择「添加新脚本」，打开 [脚本源码](https://github.com/printsdf/Notion-Formula-Auto-Conversion-Tool/blob/main/Notion-Formula-Auto-Conversion-Tool.user.js)，复制全部内容并保存。
 5. 打开或刷新 [Notion](https://app.notion.com/) 页面。
 
 本 Fork 的 `@updateURL` 和 `@downloadURL` 已指向本仓库 `main` 分支，避免旧版 Greasy Fork 更新覆盖修复内容。自动更新是否触发取决于 Tampermonkey 设置，也可以手动更新。
