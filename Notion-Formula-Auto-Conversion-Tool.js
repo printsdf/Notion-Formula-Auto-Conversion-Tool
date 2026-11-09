@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Notion-Formula-Auto-Conversion-Tool
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.5.1
 // @description  Notion 自动公式转换工具
 // @author       skyance、0xstride、fengjy73、Sparidae、ckrvxr
 // @match        https://www.notion.so/*
+// @match        https://app.notion.com/*
 // @match        https://notion.com/*
 // @match        https://*.notion.com/*
 // @grant        GM_addStyle
@@ -12,9 +13,9 @@
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @github       https://github.com/skyance/Notion-Formula-Auto-Conversion-Tool
-// @downloadURL https://update.greasyfork.org/scripts/525730/Notion-Formula-Auto-Conversion-Tool.user.js
-// @updateURL https://update.greasyfork.org/scripts/525730/Notion-Formula-Auto-Conversion-Tool.meta.js
+// @github       https://github.com/printsdf/Notion-Formula-Auto-Conversion-Tool
+// @downloadURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.js
+// @updateURL https://raw.githubusercontent.com/printsdf/Notion-Formula-Auto-Conversion-Tool/main/Notion-Formula-Auto-Conversion-Tool.js
 // ==/UserScript==
 
 (function () {
@@ -640,7 +641,7 @@
     }
 
     return !!element.closest(
-      '.notion-overlay-container, [role="dialog"], .notion-modal',
+      '.notion-overlay-container, [role="dialog"], .notion-modal, .notion-equation-block',
     );
   }
 
@@ -696,7 +697,7 @@
     }
 
     const overlayRoots = Array.from(
-      document.querySelectorAll('.notion-overlay-container, [role="dialog"], .notion-modal'),
+      document.querySelectorAll('.notion-overlay-container, [role="dialog"], .notion-modal, .notion-equation-block'),
     ).reverse();
 
     for (const root of overlayRoots) {
@@ -746,7 +747,7 @@
       document.querySelectorAll('[contenteditable="true"]'),
     ).filter((editor) => {
       const simpleTableCell = isSimpleTableCellEditor(editor);
-      if (editor.closest("#formula-helper")) {
+      if (editor.closest("#formula-helper, .notion-code-block, .notion-equation-block")) {
         return false;
       }
       if (editor.closest('.notion-table-view, [role="gridcell"], [role="cell"]')) {
@@ -904,6 +905,76 @@
     }
   }
 
+
+  // Slash commands are handled by Notion's editor. Insert one character at a time
+  // and wait for an actual menu instead of pasting "/block equation" as plain text.
+  async function typeSlashQuery(text) {
+    for (const char of text) {
+      const target = document.activeElement;
+      if (!target || !(target.isContentEditable || target.matches("input, textarea"))) {
+        return false;
+      }
+      const options = {
+        key: char,
+        code: char === "/" ? "Slash" : "Key" + char.toUpperCase(),
+        bubbles: true,
+        cancelable: true,
+      };
+      target.dispatchEvent(new KeyboardEvent("keydown", options));
+      target.dispatchEvent(new KeyboardEvent("keypress", options));
+      target.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, inputType: "insertText", data: char,
+      }));
+      const ok = document.execCommand("insertText", false, char);
+      target.dispatchEvent(new KeyboardEvent("keyup", options));
+      if (!ok) return false;
+      // Do not emit an extra input event; execCommand already does so.
+      await new Promise(resolve => setTimeout(resolve, 65));
+    }
+    return true;
+  }
+
+  function slashMenuRoot() {
+    const roots = document.querySelectorAll(
+      '.notion-overlay-container, [role="menu"], [role="listbox"]'
+    );
+    return Array.from(roots).find(root =>
+      isVisibleElement(root) &&
+      root.querySelector('.notion-selectable, [role="menuitem"], [role="option"]')
+    ) || null;
+  }
+
+  function findBlockEquationMenuItem() {
+    const root = slashMenuRoot();
+    if (!root) return null;
+    const items = root.querySelectorAll(
+      '.notion-selectable, [role="menuitem"], [role="option"]'
+    );
+    for (const item of items) {
+      if (!isVisibleElement(item)) continue;
+      const label = (item.textContent || "").replace(/\s+/g, " ").trim();
+      if (!label || label.length > 140 || /inline equation|行内公式|内联公式/i.test(label)) {
+        continue;
+      }
+      if (/^(?:block equation|equation|math equation|数学公式|块级公式|公式块|方程式)(?:\b|\s|$)/i.test(label)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  async function restoreFailedSlash(editor, start, original) {
+    if (!editor?.isConnected) return false;
+    // Restore only when the current editor still contains the slash query
+    // at the original position. Never overwrite an unrelated Notion block.
+    const suffix = (editor.textContent || "").slice(start);
+    const match = /^\/(?:math)?/.exec(suffix);
+    if (!match) return false;
+    const selection = await selectRange(editor, start, start + match[0].length);
+    if (!selection || selection.toString() !== match[0]) return false;
+    return !!document.execCommand("insertText", false, original);
+  }
+
   // 优化的公式转换
   async function convertFormula(editor, formulaObj) {
     try {
@@ -927,8 +998,9 @@
         useDisplayStyle = true;
       }
 
-      const rangeStart = renderMode === "block" ? lineStart : start;
-      const rangeEnd = renderMode === "block" ? lineEnd : end;
+      // Only replace the formula itself: deleting its entire line can lose content.
+      const rangeStart = start;
+      const rangeEnd = end;
       const range = await selectRange(editor, rangeStart, rangeEnd);
       if (!range) {
         console.warn("未找到匹配的文本范围");
@@ -946,53 +1018,52 @@
       });
 
       if (renderMode === "block") {
-        // 块公式：清空整行，再创建 block equation
-        const originalText = editor.textContent;
-        document.execCommand("delete");
-        await waitForCondition(
-          () =>
-            editor.textContent !== originalText ||
-            document.activeElement !== editor,
-          {
-            timeout: 120,
-            interval: 10,
-          },
-        );
-
-        // 重新焦点聚焦，确保光标留在当前块
-        await ensureFocus(editor);
-        await sleep(16);
-
-        // 输入 /block equation 命令
-        await simulateTyping("/block equation", true);
-        await sleep(40);
-
-        // 优先按 Enter 选择命令
-        await simulateKey("Enter");
-        const blockInput = await waitForInlineInput(editor, 10, 15);
-        if (!blockInput) {
-          updateStatus("块公式输入框未打开，已跳过当前公式", 4000);
+        if (window.getSelection()?.toString() !== formulaObj.raw) {
+          updateStatus("块公式选区不匹配，已跳过");
           return false;
         }
 
-        // 输入公式内容
+        if (!await typeSlashQuery("/")) {
+          updateStatus("无法触发块公式命令，已跳过");
+          return false;
+        }
+        if (!await waitForCondition(slashMenuRoot, {timeout: 1100, interval: 30})) {
+          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
+          updateStatus(restored ? "斜杠菜单未打开，已恢复原文" : "斜杠菜单未打开，请检查原文");
+          return false;
+        }
+        if (!await typeSlashQuery("math")) {
+          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
+          updateStatus(restored ? "无法输入 math，已恢复原文" : "无法输入 math，请检查原文");
+          return false;
+        }
+        const menuItem = await waitForCondition(findBlockEquationMenuItem, {
+          timeout: 1500, interval: 35,
+        });
+        if (!menuItem) {
+          const restored = await restoreFailedSlash(editor, start, formulaObj.raw);
+          updateStatus(restored ? "未找到块公式菜单项，已恢复原文" : "未找到块公式菜单项，请检查原文");
+          return false;
+        }
+        await simulateClick(menuItem);
+
+        const blockInput = await waitForInlineInput(editor, 40, 35);
+        if (!blockInput) {
+          // The slash action may already have replaced the original block.
+          // Do not blindly undo other edits after a structural transformation.
+          updateStatus("块公式输入框未出现，请检查当前块");
+          return false;
+        }
         if (!selectElementContents(blockInput)) {
-          updateStatus("无法安全选中块公式输入框，已跳过当前公式", 4000);
+          updateStatus("无法选中块公式输入框，请检查当前块");
           return false;
         }
         await simulateTyping(normalizedContent, true);
-        await sleep(16);
-
-        // 按 Enter 完成编辑（而非 Escape），避免行序错乱
+        await sleep(30);
         await simulateKey("Enter", blockInput);
         await waitForCondition(() => document.activeElement !== blockInput, {
-          timeout: 140,
-          interval: 10,
+          timeout: 800, interval: 35,
         });
-
-        // 再次焦点回到原编辑区域，稳定行顺序
-        await ensureFocus(editor);
-        await sleep(16);
       } else {
         const opened = await openInlineEquationEditor(editor, range);
         if (!opened) {
@@ -1248,14 +1319,13 @@
 
   refreshToggleMenu();
 
-  GM_registerMenuCommand("🔗 反馈问题", () => window.open("https://github.com/skyance/Notion-Formula-Auto-Conversion-Tool/issues"));
+  GM_registerMenuCommand("🔗 反馈问题", () => window.open("https://github.com/printsdf/Notion-Formula-Auto-Conversion-Tool/issues"));
 
   refreshTotalMenu();
 
   // ===== 检测 Notion 侧边栏/设置面板/对话框/其他页面，自动隐藏按钮 =====
   function shouldHide() {
     return (
-      !document.querySelector('.notion-topbar-share-menu') ||
       document.querySelector('.chat_sidebar') ||
       document.querySelector('.notion-space-settings') ||
       document.querySelector('.notion-dialog')
