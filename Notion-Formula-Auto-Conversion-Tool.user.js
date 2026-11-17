@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Notion-Formula-Auto-Conversion-Tool
 // @namespace    http://tampermonkey.net/
-// @version      3.5.2
+// @version      3.5.3
 // @description  Notion 自动公式转换工具
 // @author       skyance、0xstride、fengjy73、Sparidae、ckrvxr
 // @match        https://www.notion.so/*
@@ -784,10 +784,10 @@
     });
   }
 
-  function collectFormulaTasks(filterFn = () => true) {
+  function collectFormulaTasks(filterFn = () => true, editors = getEditableEditors()) {
     const tasks = [];
 
-    for (const editor of getEditableEditors()) {
+    for (const editor of editors) {
       const simpleTableCell = isSimpleTableCellEditor(editor);
       const formulas = findFormulas(editor.textContent).filter(
         (formula) => filterFn(formula) && (!simpleTableCell || formula.type === "inline"),
@@ -1406,78 +1406,191 @@
     return true;
   }
 
+  // ---------- 滚动加载 ----------
+  // Notion 只渲染视口附近的块。长页面必须边滚动边转换。
+  function getScrollRoot() {
+    const anchor =
+      getEditableEditors()[0] || document.querySelector(".notion-page-content");
+    for (
+      let node = anchor?.parentElement;
+      node && node !== document.body;
+      node = node.parentElement
+    ) {
+      const style = window.getComputedStyle(node);
+      if (
+        /(auto|scroll|overlay)/.test(style.overflowY) &&
+        node.scrollHeight > node.clientHeight + 4
+      ) {
+        return node;
+      }
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function isWindowScrollRoot(root) {
+    return root === document.scrollingElement || root === document.documentElement;
+  }
+
+  function isAtScrollBottom(root) {
+    return root.scrollTop + root.clientHeight >= root.scrollHeight - 4;
+  }
+
+  function elementContentBottom(element, root) {
+    const rect = element.getBoundingClientRect();
+    if (isWindowScrollRoot(root)) {
+      return rect.bottom + root.scrollTop;
+    }
+    return rect.bottom - root.getBoundingClientRect().top + root.scrollTop;
+  }
+
   // ---------- 核心转换 ----------
   async function convertFormulas() {
     if (isProcessing) return;
     isProcessing = true; shouldStop = false;
     panel.classList.add("processing");
+
+    let scrollRoot = null;
+    let startScrollTop = 0;
+
     try {
-      // 扫描并获取总数
-      const initialTasks = collectFormulaTasks();
-      let totalFormulas = initialTasks.reduce((sum, item) => sum + item.formulas.length, 0);
-      totalFormulas += findCrossBlockGroups().length;
-      if (totalFormulas === 0) {
-        progressText.textContent = "0";
-        progressBar.style.width = "0%";
-        return;
-      }
+      scrollRoot = getScrollRoot();
+      startScrollTop = scrollRoot.scrollTop;
+
+      const attemptedEditors = new WeakSet();
+      const failedGroups = new Set();
+      const groupKey = (group) => `${group.blockId || "?"}::${group.raw}`;
+      const viewHeight = () =>
+        isWindowScrollRoot(scrollRoot) ? window.innerHeight : scrollRoot.clientHeight;
 
       let formulaCount = 0;
-      let lastProgressUpdate = 0;
-      updateProgress(0, totalFormulas, "scanning");
+      let totalFormulas = 0;
+      let round = 0;
+      let idleRounds = 0;
 
-      const updateProgressIfNeeded = (force = false) => {
-        const now = Date.now();
-        if (
-          force ||
-          formulaCount === totalFormulas ||
-          now - lastProgressUpdate >= 80
-        ) {
-          updateProgress(formulaCount, totalFormulas, `${formulaCount}/${totalFormulas}`);
-          lastProgressUpdate = now;
+      const reportProgress = () =>
+        updateProgress(
+          formulaCount,
+          totalFormulas,
+          totalFormulas ? `${formulaCount}/${totalFormulas}` : "scanning",
+        );
+
+      const addTasks = (tasks) => {
+        let discovered = 0;
+        for (const { formulas } of tasks) {
+          discovered += formulas.length;
+          totalFormulas += formulas.length;
         }
+        reportProgress();
+        return discovered;
       };
 
-      const phases = [
-        { name: "Inline", getTasks: () => initialTasks.map(({ editor, formulas }) => ({ editor, formulas: formulas.filter(f => f.type === "inline") })).filter(item => item.formulas.length) },
-        { name: "Block", getTasks: () => collectFormulaTasks(f => f.type === "block") }
-      ];
-
-      for (const phase of phases) {
-        if (shouldStop) break;
-        const phaseTasks = phase.getTasks();
-        for (const { editor, formulas } of phaseTasks.slice().reverse()) {
+      const runTasks = async (tasks) => {
+        for (const { editor, formulas } of tasks.slice().reverse()) {
           if (shouldStop) break;
           for (const formulaObj of formulas.slice().reverse()) {
             if (shouldStop) break;
-            const result = await convertFormula(editor, formulaObj);
-            if (result) {
+            // Notion 可能在上一次转换后重建块节点，禁止操作已脱离文档的编辑器。
+            if (!editor.isConnected) break;
+            if (await convertFormula(editor, formulaObj)) {
               formulaCount++;
-              updateProgressIfNeeded();
+              reportProgress();
             }
           }
         }
-      }
+      };
 
-      // 跨块块公式放在最后，从页面底部往上转换，避免删除块影响前面的位置。
-      for (const group of findCrossBlockGroups().slice().reverse()) {
-        if (shouldStop) break;
-        const result = await convertCrossBlockFormula(group);
-        if (result) {
-          formulaCount++;
-          updateProgressIfNeeded();
+      updateProgress(0, 0, "scanning");
+
+      while (!shouldStop && round++ < 500) {
+        // 视口附近可能已经渲染了好几屏内容；先全部转换，再跳到已扫描区域的底部。
+        const batchEditors = getEditableEditors().filter(
+          (editor) => !attemptedEditors.has(editor),
+        );
+        let scannedBottom = 0;
+        for (const editor of batchEditors) {
+          scannedBottom = Math.max(
+            scannedBottom,
+            elementContentBottom(editor, scrollRoot),
+          );
         }
+        const heightBefore = scrollRoot.scrollHeight;
+
+        const inlineTasks = collectFormulaTasks(
+          (f) => f.type === "inline",
+          batchEditors,
+        );
+        let discovered = addTasks(inlineTasks);
+        await runTasks(inlineTasks);
+
+        if (!shouldStop) {
+          // 行内转换会改变文本长度，也可能重建块节点；块公式按当前 DOM 重新扫描。
+          const liveEditors = getEditableEditors().filter(
+            (editor) => !attemptedEditors.has(editor),
+          );
+          const blockTasks = collectFormulaTasks(
+            (f) => f.type === "block",
+            liveEditors,
+          );
+          discovered += addTasks(blockTasks);
+          await runTasks(blockTasks);
+        }
+
+        if (!shouldStop) {
+          const groups = findCrossBlockGroups().filter(
+            (group) => !failedGroups.has(groupKey(group)),
+          );
+          totalFormulas += groups.length;
+          discovered += groups.length;
+          reportProgress();
+          for (const group of groups.slice().reverse()) {
+            if (shouldStop) break;
+            if (await convertCrossBlockFormula(group)) {
+              formulaCount++;
+              reportProgress();
+            } else {
+              failedGroups.add(groupKey(group));
+            }
+          }
+        }
+
+        batchEditors.forEach((editor) => attemptedEditors.add(editor));
+
+        if (shouldStop) break;
+        if (isAtScrollBottom(scrollRoot) && discovered === 0) {
+          // 留出渲染时间再确认一次，避免把尚未挂载的尾部内容当成已扫完。
+          if (idleRounds++ > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 700));
+        } else {
+          idleRounds = 0;
+        }
+
+        const currentTop = scrollRoot.scrollTop;
+        // 转换可能缩短页面（多行公式合并成公式块），按高度差修正滚动目标，避免跳过内容。
+        const shrink = Math.max(0, heightBefore - scrollRoot.scrollHeight);
+        const target = scannedBottom
+          ? Math.max(
+            currentTop + 8,
+            scannedBottom - shrink - viewHeight() * 0.25,
+          )
+          : currentTop + viewHeight() * 0.75;
+        scrollRoot.scrollTop = target;
+        await waitForCondition(
+          () =>
+            isAtScrollBottom(scrollRoot) ||
+            getEditableEditors().some((editor) => !attemptedEditors.has(editor)),
+          { timeout: 1200, interval: 80 },
+        );
       }
 
       if (formulaCount > 0) {
         totalConverted += formulaCount;
         GM_setValue("totalConverted", totalConverted);
+        refreshTotalMenu();
       }
 
-      updateProgressIfNeeded(true);
       updateProgress(formulaCount, totalFormulas, shouldStop ? "Stopped" : "Done");
-      refreshTotalMenu();
     } finally {
+      if (scrollRoot) scrollRoot.scrollTop = startScrollTop;
       isProcessing = false;
       panel.classList.remove("processing");
       if (!shouldStop) {
