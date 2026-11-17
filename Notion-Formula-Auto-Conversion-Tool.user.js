@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Notion-Formula-Auto-Conversion-Tool
 // @namespace    http://tampermonkey.net/
-// @version      3.5.3
+// @version      3.5.8
 // @description  Notion 自动公式转换工具
 // @author       skyance、0xstride、fengjy73、Sparidae、ckrvxr
 // @match        https://www.notion.so/*
@@ -123,6 +123,8 @@
 
   // ---------- 工具函数 ----------
   const sleep = (ms = 0) => new Promise((resolve) => setTimeout(resolve, getDelay(ms)));
+  // UI waits must not be scaled down; Notion needs real time to render.
+  const uiDelay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
   // ---------- 菜单状态 ----------
   let totalConverted = GM_getValue("totalConverted", 0);
@@ -637,32 +639,6 @@
     return normalized;
   }
 
-  function isSafeInlineInputElement(element, editor) {
-    if (!element || element === editor) {
-      return false;
-    }
-
-    if (element.closest("#formula-helper")) {
-      return false;
-    }
-
-    if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") {
-      return true;
-    }
-
-    if (!element.isContentEditable) {
-      return false;
-    }
-
-    if (editor.contains(element)) {
-      return true;
-    }
-
-    return !!element.closest(
-      '.notion-overlay-container, [role="dialog"], .notion-modal, .notion-equation-block',
-    );
-  }
-
   function selectElementContents(element) {
     if (!element) {
       return false;
@@ -693,61 +669,6 @@
     }
     const style = window.getComputedStyle(element);
     return style.display !== "none" && style.visibility !== "hidden";
-  }
-
-  function findVisibleSafeElement(elements, editor) {
-    for (const element of elements) {
-      if (isVisibleElement(element) && isSafeInlineInputElement(element, editor)) {
-        return element;
-      }
-    }
-    return null;
-  }
-
-  function findInlineInputCandidate(editor) {
-    const inputSelectors = 'input, textarea, [contenteditable="true"]';
-    const localCandidate = findVisibleSafeElement(
-      editor.querySelectorAll(inputSelectors),
-      editor,
-    );
-    if (localCandidate) {
-      return localCandidate;
-    }
-
-    const overlayRoots = Array.from(
-      document.querySelectorAll('.notion-overlay-container, [role="dialog"], .notion-modal, .notion-equation-block'),
-    ).reverse();
-
-    for (const root of overlayRoots) {
-      const candidate = findVisibleSafeElement(root.querySelectorAll(inputSelectors), editor);
-      if (candidate) {
-        debugLog("inline input candidate", describeElement(candidate));
-        return candidate;
-      }
-    }
-
-    return null;
-  }
-
-  async function waitForInlineInput(editor, attempts = 8, interval = 12) {
-    for (let i = 0; i < attempts; i++) {
-      const activeElement = document.activeElement;
-      debugLog(`waitForInlineInput attempt ${i + 1}`, {
-        activeElement: describeElement(activeElement),
-        editor: describeElement(editor),
-      });
-      if (isSafeInlineInputElement(activeElement, editor)) {
-        return activeElement;
-      }
-
-      const candidate = findInlineInputCandidate(editor);
-      if (candidate) {
-        return candidate;
-      }
-
-      await sleep(interval);
-    }
-    return null;
   }
 
   function isSimpleTableCellEditor(editor) {
@@ -943,85 +864,6 @@
     return groups;
   }
 
-  function restoreSelection(range) {
-    if (!range) {
-      return;
-    }
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    debugLog("selection restored", {
-      text: selection.toString(),
-      anchorNode: selection.anchorNode?.textContent?.slice(0, 60) || null,
-    });
-  }
-
-  async function openInlineEquationEditor(editor, selectedRange = null) {
-    const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
-    await ensureFocus(editor);
-    await sleep(isSimpleTableCellEditor(editor) ? 16 : 8);
-    restoreSelection(selectedRange);
-    await sleep(isSimpleTableCellEditor(editor) ? 16 : 8);
-    debugLog("openInlineEquationEditor shortcut mode", {
-      editor: describeElement(editor),
-      selectedText: selectedRange?.toString() || "",
-      activeElement: describeElement(document.activeElement),
-    });
-    await simulateShortcut(isMac ? "Meta+Shift+E" : "Ctrl+Shift+E", document.activeElement || editor);
-    await sleep(isSimpleTableCellEditor(editor) ? 20 : 10);
-    return true;
-  }
-
-  // 文本输入模拟
-  async function simulateTyping(text, quick = false) {
-    const activeElement = document.activeElement;
-    if (activeElement) {
-      if (quick) {
-        // 快速模式：直接插入整段文本 (模拟粘贴)
-        const inputEvent = new InputEvent("beforeinput", {
-          bubbles: true,
-          cancelable: true,
-          inputType: "insertText",
-          data: text,
-        });
-        activeElement.dispatchEvent(inputEvent);
-
-        document.execCommand("insertText", false, text);
-
-        const inputEventAfter = new InputEvent("input", {
-          bubbles: true,
-          cancelable: false,
-          inputType: "insertText",
-          data: text,
-        });
-        activeElement.dispatchEvent(inputEventAfter);
-      } else {
-        // 普通模式：逐字输入 (用于触发命令菜单等)
-        for (const char of text) {
-          const inputEvent = new InputEvent("beforeinput", {
-            bubbles: true,
-            cancelable: true,
-            inputType: "insertText",
-            data: char,
-          });
-          activeElement.dispatchEvent(inputEvent);
-
-          document.execCommand("insertText", false, char);
-
-          const inputEventAfter = new InputEvent("input", {
-            bubbles: true,
-            cancelable: false,
-            inputType: "insertText",
-            data: char,
-          });
-          activeElement.dispatchEvent(inputEventAfter);
-
-          await sleep(5);
-        }
-      }
-    }
-  }
-
   // 单个按键模拟
   async function simulateKey(keyName, target = null) {
     const keyInfo = getKeyCode(keyName);
@@ -1031,14 +873,23 @@
       key: keyInfo.key,
       code: keyInfo.code,
       keyCode: keyInfo.keyCode,
+      which: keyInfo.keyCode,
       bubbles: true,
+      cancelable: true,
     });
     const keyupEvent = new KeyboardEvent("keyup", {
       key: keyInfo.key,
       code: keyInfo.code,
       keyCode: keyInfo.keyCode,
+      which: keyInfo.keyCode,
       bubbles: true,
+      cancelable: true,
     });
+
+    // Mark synthetic keys so the script's own Escape-to-stop listener
+    // does not treat them as user input.
+    keydownEvent.__formulaScriptEvent = true;
+    keyupEvent.__formulaScriptEvent = true;
 
     eventTarget.dispatchEvent(keydownEvent);
     await sleep(4);
@@ -1066,58 +917,130 @@
   }
 
 
-  // Slash commands are handled by Notion's editor. Insert one character at a time
-  // and wait for an actual menu instead of pasting "/block equation" as plain text.
-  async function typeSlashQuery(text) {
-    for (const char of text) {
-      const target = document.activeElement;
-      if (!target || !(target.isContentEditable || target.matches("input, textarea"))) {
-        return false;
-      }
-      const options = {
-        key: char,
-        code: char === "/" ? "Slash" : "Key" + char.toUpperCase(),
-        bubbles: true,
-        cancelable: true,
-      };
-      target.dispatchEvent(new KeyboardEvent("keydown", options));
-      target.dispatchEvent(new KeyboardEvent("keypress", options));
-      target.dispatchEvent(new InputEvent("beforeinput", {
-        bubbles: true, cancelable: true, inputType: "insertText", data: char,
-      }));
-      const ok = document.execCommand("insertText", false, char);
-      target.dispatchEvent(new KeyboardEvent("keyup", options));
-      if (!ok) return false;
-      // Do not emit an extra input event; execCommand already does so.
-      await new Promise(resolve => setTimeout(resolve, 65));
-    }
-    return true;
+  // Notion opens its slash menu from the real input event of execCommand.
+  // Synthetic keydown/keypress events are ignored by the current editor and
+  // only leave a bare "/" in the block.
+  async function insertCommandText(editor, text) {
+    const before = editor?.isConnected ? editor.textContent : null;
+    const ok = document.execCommand("insertText", false, text);
+    if (ok) return true;
+    if (!editor?.isConnected) return true;
+    return !!(await waitForCondition(
+      () => !editor.isConnected || editor.textContent !== before,
+      { timeout: 300, interval: 25 },
+    ));
   }
 
-  function slashMenuRoots() {
-    return Array.from(
-      document.querySelectorAll('.notion-overlay-container, [role="menu"], [role="listbox"]')
-    ).filter(root =>
-      isVisibleElement(root) &&
-      root.querySelector('.notion-selectable, [role="menuitem"], [role="option"]')
+  // Undo the "/" + query left by a failed slash command. Compare with the
+  // text captured before the command, so partial queries and Notion's block
+  // re-renders are handled without overwriting unrelated content.
+  async function restoreFailedSlash(editor, originalText, raw, blockId = null) {
+    // Leave Notion's slash-command state first; otherwise the editor may
+    // ignore the edit and keep showing the command text.
+    await simulateKey("Escape", document.activeElement || editor);
+    await uiDelay(120);
+
+    // Notion may re-render the block while the slash menu is open. Re-resolve
+    // the editor from its block id instead of using a stale element reference.
+    const resolveEditor = () => {
+      if (editor?.isConnected) return editor;
+      if (!blockId) return null;
+      return document.querySelector(
+        `[data-block-id="${CSS.escape(blockId)}"] [contenteditable="true"]`,
+      );
+    };
+    const liveEditor = resolveEditor();
+    if (!liveEditor || liveEditor.closest(".notion-equation-block")) return false;
+
+    const verify = async () => !!(await waitForCondition(
+      () => resolveEditor()?.textContent === originalText,
+      { timeout: 500, interval: 30 },
+    ));
+
+    const current = liveEditor.textContent || "";
+    if (current === originalText) return true; // The original text is intact.
+
+    // The formula is deleted before the slash command. Put it back when the
+    // block is empty; this also covers a failed "/math" insertion.
+    if (!current.trim() && originalText.includes(raw)) {
+      if (!selectElementContents(liveEditor)) return false;
+      if (!document.execCommand("insertText", false, originalText)) return false;
+      return verify();
+    }
+
+    const maxPrefix = Math.min(current.length, originalText.length);
+    let prefix = 0;
+    while (prefix < maxPrefix && current[prefix] === originalText[prefix]) prefix++;
+    let suffix = 0;
+    while (
+      suffix < current.length - prefix &&
+      suffix < originalText.length - prefix &&
+      current[current.length - 1 - suffix] === originalText[originalText.length - 1 - suffix]
+    ) suffix++;
+
+    const changed = current.slice(prefix, current.length - suffix);
+    const originalSlice = originalText.slice(prefix, originalText.length - suffix);
+    // Only undo an edit that looks like our own "/" + typing, and only when
+    // the rest of the block still matches the original text.
+    if (!changed.startsWith("/") || changed.length > raw.length + 24) return false;
+    if (originalSlice !== raw && originalSlice !== "") return false;
+
+    const selection = await selectRange(liveEditor, prefix, current.length - suffix);
+    if (!selection || selection.toString() !== changed) return false;
+    const ok = originalSlice === ""
+      ? document.execCommand("delete")
+      : document.execCommand("insertText", false, originalSlice);
+    if (!ok) return false;
+    return verify();
+  }
+
+  function isEditableElement(element) {
+    return !!element && (
+      element.isContentEditable ||
+      element.tagName === "INPUT" ||
+      element.tagName === "TEXTAREA"
     );
   }
 
-  function slashMenuRoot() {
-    return slashMenuRoots()[0] || null;
+  function findDoneButton() {
+    const roots = Array.from(document.querySelectorAll(
+      '.notion-overlay-container, [role="dialog"], .notion-equation-block',
+    )).filter(isVisibleElement);
+    for (const root of roots.length ? roots : [document.body]) {
+      for (const button of root.querySelectorAll('[role="button"], button')) {
+        if (!isVisibleElement(button)) continue;
+        const label = (button.textContent || "").replace(/\s+/g, " ").trim();
+        if (/done|完成|确定/i.test(label)) return button;
+      }
+    }
+    return null;
+  }
+
+  // Notion shows KaTeX errors in a role="alert" region. Only look inside the
+  // equation dialog: the page has unrelated alerts (toasts, live regions), and
+  // a stale alert must not fail every later formula.
+  function findEquationError(dialogRoot) {
+    if (!dialogRoot) return null;
+    for (const alert of dialogRoot.querySelectorAll('[role="alert"]')) {
+      if (!isVisibleElement(alert)) continue;
+      const text = (alert.textContent || "").trim();
+      if (/katex|parse error|syntax|语法|解析/i.test(text)) return alert;
+    }
+    return null;
   }
 
   function findBlockEquationMenuItem() {
-    for (const root of slashMenuRoots()) {
-      const items = root.querySelectorAll(
-        '.notion-selectable, [role="menuitem"], [role="option"]'
-      );
-      for (const item of items) {
+    const roots = Array.from(document.querySelectorAll(
+      '.notion-overlay-container, [role="menu"], [role="listbox"]',
+    )).filter(isVisibleElement);
+    for (const root of roots) {
+      for (const item of root.querySelectorAll(
+        '.notion-selectable, [role="menuitem"], [role="option"]',
+      )) {
         if (!isVisibleElement(item)) continue;
         const label = (item.textContent || "").replace(/\s+/g, " ").trim();
-        if (!label || label.length > 140 || /inline equation|行内公式|内联公式/i.test(label)) {
-          continue;
-        }
+        if (!label || label.length > 140) continue;
+        if (/inline equation|行内公式|内联公式/i.test(label)) continue;
         if (/block equation|math equation|equation|数学公式|块级公式|公式块|公式|方程式/i.test(label)) {
           return item;
         }
@@ -1126,70 +1049,86 @@
     return null;
   }
 
-  async function restoreFailedSlash(editor, start, original, blockId = null, query = "") {
-    // Notion may re-render the block while the slash menu is open. Re-resolve
-    // the editor from its block id instead of using a stale element reference.
-    let liveEditor = editor?.isConnected ? editor : null;
-    if (!liveEditor && blockId) {
-      liveEditor = document.querySelector(
-        `[data-block-id="${CSS.escape(blockId)}"] [contenteditable="true"]`,
-      );
+  function insertTextIntoElement(element, text) {
+    if (element.value !== undefined) {
+      element.value = text;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
     }
-    if (!liveEditor) return false;
-    // Restore only when the current editor still contains the slash query
-    // at the original position. Never overwrite an unrelated Notion block.
-    const expected = `/${query || ""}`;
-    const suffix = (liveEditor.textContent || "").slice(start);
-    if (!suffix.startsWith(expected)) return false;
-    const selection = await selectRange(liveEditor, start, start + expected.length);
-    if (!selection || selection.toString() !== expected) return false;
-    return !!document.execCommand("insertText", false, original);
+    if (!selectElementContents(element)) return false;
+    return !!document.execCommand("insertText", false, text);
   }
 
   async function insertBlockEquation(editor, content) {
     const blockId =
       editor.closest?.("[data-block-id]")?.getAttribute("data-block-id") || null;
-    let query = null;
-    const fail = (reason, mutated) => ({ ok: false, reason, mutated, blockId, query });
+    const fail = (reason) => ({ ok: false, reason, blockId });
 
-    if (!await typeSlashQuery("/")) {
-      return fail("无法触发块公式命令", false);
-    }
-    const menuRoot = await waitForCondition(slashMenuRoot, {timeout: 1100, interval: 30});
-    if (!menuRoot) {
-      return fail("斜杠菜单未打开", true);
-    }
-
-    let menuItem = findBlockEquationMenuItem();
-    if (!menuItem) {
-      // Notion slash search matches the localized item name. Typing "math"
-      // in a Chinese UI filters out every item, so pick the query by menu language.
-      query = /[㐀-鿿]/.test(menuRoot.textContent || "") ? "公式" : "math";
-      if (!await typeSlashQuery(query)) {
-        return fail("无法输入命令关键词", true);
+    // Notion opens the slash menu only when "/" is typed into an empty block.
+    // Delete the selected formula first; synthetic keyboard events are ignored.
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
+      if (!document.execCommand("delete")) {
+        return fail("无法删除原公式");
       }
-      menuItem = await waitForCondition(findBlockEquationMenuItem, {
-        timeout: 1500, interval: 35,
-      });
+      await uiDelay(60);
     }
-    if (!menuItem) {
-      return fail("未找到块公式菜单项", true);
+    if (!await insertCommandText(editor, "/math")) {
+      return fail("无法触发块公式命令");
     }
-    await simulateClick(menuItem);
+    await uiDelay(400);
 
-    const blockInput = await waitForInlineInput(editor, 40, 35);
+    // Enter selects the highlighted first item: Block equation. If Notion
+    // ignores the synthetic key, click the same menu item instead.
+    await simulateKey("Enter");
+    await uiDelay(300);
+
+    const waitForBlockInput = (timeout) => waitForCondition(() => {
+      const active = document.activeElement;
+      if (!active || !isEditableElement(active)) return null;
+      // The old block editor is still editable and focused when the menu did
+      // not open; never write the formula into the page text.
+      if (active === editor || editor.contains?.(active)) return null;
+      return active;
+    }, { timeout, interval: 40 });
+
+    let blockInput = await waitForBlockInput(1200);
     if (!blockInput) {
-      return fail("块公式输入框未出现", true);
+      const menuItem = findBlockEquationMenuItem();
+      if (menuItem) {
+        await simulateClick(menuItem);
+        blockInput = await waitForBlockInput(1200);
+      }
     }
-    if (!selectElementContents(blockInput)) {
-      return fail("无法选中块公式输入框", true);
+    if (!blockInput) {
+      return fail("块公式输入框未出现");
     }
-    await simulateTyping(normalizeFormulaContent(content), true);
-    await sleep(30);
-    await simulateKey("Enter", blockInput);
-    await waitForCondition(() => document.activeElement !== blockInput, {
-      timeout: 800, interval: 35,
-    });
+    if (!insertTextIntoElement(blockInput, normalizeFormulaContent(content))) {
+      return fail("无法写入块公式内容");
+    }
+    await uiDelay(100);
+
+    const dialogRoot = blockInput.closest?.(
+      '[role="dialog"], .notion-overlay-container',
+    ) || null;
+    const equationError = findEquationError(dialogRoot);
+    if (equationError) {
+      console.warn(
+        "[Formula] 公式错误提示:",
+        (equationError.textContent || "").trim().slice(0, 300),
+        "输入内容:",
+        String(blockInput.value ?? blockInput.textContent ?? "").slice(0, 300),
+      );
+      await simulateKey("Escape", blockInput);
+      return fail("公式语法错误");
+    }
+    const done = findDoneButton();
+    if (done) {
+      await simulateClick(done);
+    } else {
+      await simulateKey("Enter", blockInput);
+    }
+    await uiDelay(200);
     return { ok: true };
   }
 
@@ -1241,67 +1180,35 @@
           return false;
         }
 
+        const originalText = editor.textContent;
         const result = await insertBlockEquation(editor, content);
         if (!result.ok) {
-          if (result.mutated) {
-            const restored = await restoreFailedSlash(
-              editor, start, formulaObj.raw, result.blockId, result.query,
-            );
-            updateStatus(`${result.reason}，${restored ? "已恢复原文" : "请检查原文"}`);
-          } else {
-            updateStatus(`${result.reason}，已跳过`);
-          }
+          // Always try to undo: the slash may already be in the block even
+          // when the command reports no mutation.
+          const restored = await restoreFailedSlash(
+            editor, originalText, formulaObj.raw, result.blockId,
+          );
+          updateStatus(`${result.reason}，${restored ? "已恢复原文" : "请检查原文"}`);
           return false;
         }
       } else {
-        const opened = await openInlineEquationEditor(editor, range);
-        if (!opened) {
+        // Notion converts the "$$...$$" text pattern into an inline equation
+        // on input. This works from execCommand; synthetic shortcuts do not.
+        const wrapped = `$$${normalizedContent}$$`;
+        const before = editor.isConnected ? editor.textContent : null;
+        if (!document.execCommand("insertText", false, wrapped)) {
+          updateStatus("无法写入行内公式，已跳过");
           return false;
         }
-
-        // 仅在焦点进入独立公式输入框时继续，避免误伤正文
-        const inlineInput = await waitForInlineInput(
-          editor,
-          isSimpleTableCellEditor(editor) ? 30 : 8,
-          isSimpleTableCellEditor(editor) ? 25 : 12,
-        );
-        if (!inlineInput) {
-          updateStatus(
-            "行内公式输入框未打开，已跳过当前公式以避免误替换",
-            4000,
-          );
+        const converted = await waitForCondition(() => {
+          if (!editor.isConnected) return true;
+          return editor.textContent !== before &&
+            !editor.textContent.includes(wrapped);
+        }, { timeout: 1200, interval: 30 });
+        if (!converted) {
+          updateStatus("行内公式未转换，请检查原文");
           return false;
         }
-
-        if (!selectElementContents(inlineInput)) {
-          updateStatus("无法安全选中行内公式输入框，已跳过当前公式", 4000);
-          return false;
-        }
-
-        debugLog("inline input ready", {
-          inlineInput: describeElement(inlineInput),
-          activeElement: describeElement(document.activeElement),
-          selectedText: window.getSelection()?.toString() || "",
-        });
-
-        await simulateTyping(normalizedContent, true);
-        await sleep(10);
-
-        debugLog("inline input typed", {
-          activeElement: describeElement(document.activeElement),
-          inlineInputText: inlineInput.value || inlineInput.textContent || "",
-        });
-
-        // 按 Enter 确认
-        await simulateKey("Enter", inlineInput);
-        await waitForCondition(() => document.activeElement !== inlineInput, {
-          timeout: 140,
-          interval: 10,
-        });
-        debugLog("inline input confirmed", {
-          activeElement: describeElement(document.activeElement),
-          editorText: editor.textContent,
-        });
       }
 
       return renderMode;
@@ -1397,7 +1304,25 @@
     await focusEditor(target);
     const result = await insertBlockEquation(target, content);
     if (!result.ok) {
-      const restored = await insertPlainText(target, raw);
+      await simulateKey("Escape", document.activeElement || target);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      // Opening the slash menu may re-render the block; restore into the live
+      // leaf when the old reference is gone. Never overwrite an equation input.
+      const restoreTarget = target.isConnected ? target : lookupEditor(group.blockId);
+      const canRestore =
+        restoreTarget && !restoreTarget.closest(".notion-equation-block");
+      let restored = false;
+      if (canRestore) {
+        restored = await insertPlainText(restoreTarget, raw);
+        if (restored) {
+          restored = !!(await waitForCondition(() => {
+            const live = restoreTarget.isConnected
+              ? restoreTarget
+              : lookupEditor(group.blockId);
+            return live && compact(live.textContent) === compact(raw);
+          }, { timeout: 500, interval: 30 }));
+        }
+      }
       updateStatus(
         `${result.reason}，${restored ? "已恢复为单行文本" : "内容可能丢失"}`,
       );
@@ -1641,49 +1566,6 @@
     await sleep(8);
   }
 
-  // 键盘快捷键模拟
-  async function simulateShortcut(keyCombination, target = null) {
-    const keys = keyCombination.split("+");
-    const keyEvents = [];
-    const eventTarget =
-      target || document.activeElement || document.body || document;
-
-    // 创建键盘事件
-    for (const key of keys) {
-      const keyCode = getKeyCode(key);
-
-      keyEvents.push({
-        key: keyCode.key,
-        code: keyCode.code,
-        keyCode: keyCode.keyCode,
-        ctrlKey: keys.includes("Ctrl"),
-        shiftKey: keys.includes("Shift"),
-        altKey: keys.includes("Alt"),
-        metaKey: keys.includes("Meta"),
-        bubbles: true,
-      });
-    }
-
-    // 先按下所有修饰键
-    for (let i = 0; i < keyEvents.length - 1; i++) {
-      const event = keyEvents[i];
-      eventTarget.dispatchEvent(new KeyboardEvent("keydown", event));
-    }
-
-    // 按下最终按键
-    const finalEvent = keyEvents[keyEvents.length - 1];
-    eventTarget.dispatchEvent(new KeyboardEvent("keydown", finalEvent));
-    eventTarget.dispatchEvent(new KeyboardEvent("keyup", finalEvent));
-
-    // 释放所有修饰键
-    for (let i = keyEvents.length - 2; i >= 0; i--) {
-      const event = keyEvents[i];
-      eventTarget.dispatchEvent(new KeyboardEvent("keyup", event));
-    }
-
-    await sleep(6);
-  }
-
   // 获取键盘按键信息
   function getKeyCode(key) {
     const keyMap = {
@@ -1771,6 +1653,8 @@
 
   // 监听ESC键取消
   document.addEventListener("keydown", (e) => {
+    // Ignore the Escape presses this script sends to close Notion dialogs.
+    if (e.__formulaScriptEvent) return;
     if (e.key === "Escape" && isProcessing) {
       shouldStop = true;
       progressText.textContent = "Stopping…";
